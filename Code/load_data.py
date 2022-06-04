@@ -2,6 +2,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import BertTokenizerFast
 import numpy as np
 import torch
+import random
 
 
 class dataset(Dataset):

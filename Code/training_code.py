@@ -13,53 +13,111 @@ import time
 import os
 from useful_functions import load_data, save_data
 
+def softmax(x):
+    
+    f_x = np.exp(x) / np.sum(np.exp(x), axis = 1)
+    return f_x
 
-def train(epoch, training_loader, model, optimizer, device, max_grad_norm = 10):
+
+def train(epoch, training_loader, model, optimizer, device, divide_ratio, max_grad_norm = 10):
     tr_loss, tr_accuracy = 0, 0
     nb_tr_examples, nb_tr_steps = 0, 0
     tr_preds, tr_labels = [], []
     # put model in training mode
     model.train()
     
-    for idx, batch in enumerate(training_loader):
-        ids = batch['input_ids'].to(device, dtype = torch.long)
-        mask = batch['attention_mask'].to(device, dtype = torch.long)
-        labels = batch['labels'].to(device, dtype = torch.long)
+    idx_threshold = int(len(training_loader) * divide_ratio)
+    mysoftmax = torch.nn.Softmax(dim = 1)
+    prediction_values = torch.empty(0)
 
-        #loss, tr_logits = model(input_ids=ids, attention_mask=mask, labels=labels)
-        output = model(input_ids=ids, attention_mask=mask, labels=labels)
-        tr_loss += output[0]
-
-        nb_tr_steps += 1
-        nb_tr_examples += labels.size(0)
-           
-        # compute training accuracy
-        flattened_targets = labels.view(-1) # shape (batch_size * seq_len,)
-        active_logits = output[1].view(-1, model.num_labels) # shape (batch_size * seq_len, num_labels)
-        flattened_predictions = torch.argmax(active_logits, axis=1) # shape (batch_size * seq_len,)
-        
-        # only compute accuracy at active labels
-        active_accuracy = labels.view(-1) != -100 # shape (batch_size, seq_len)
-        #active_labels = torch.where(active_accuracy, labels.view(-1), torch.tensor(-100).type_as(labels))
-        
-        labels = torch.masked_select(flattened_targets, active_accuracy)
-        predictions = torch.masked_select(flattened_predictions, active_accuracy)
-        
-        tr_labels.extend(labels)
-        tr_preds.extend(predictions)
-
-        tmp_tr_accuracy = accuracy_score(labels.cpu().numpy(), predictions.cpu().numpy())
-        tr_accuracy += tmp_tr_accuracy
+    loss_function = torch.nn.CrossEntropyLoss(reduce = False)
     
-        # gradient clipping
-        torch.nn.utils.clip_grad_norm_(
-            parameters=model.parameters(), max_norm=max_grad_norm
-        )
+    sleep_threshold = min(0.9, 0.3 + (epoch * 0.1) )
+    confused_threshold = min(0.7, 0.1 + (epoch * 0.08))
+    
+    correct_sleep_gamma = 0.01
+    incorrect_sleep_gamma = 0.5
+    correct_confused_gamma = 0.09
+    incorrect_confused_gamma = 0.4
+
+    for idx, batch in enumerate(training_loader):
+        if idx < idx_threshold:
+            ids = batch['input_ids'].to(device, dtype = torch.long)
+            mask = batch['attention_mask'].to(device, dtype = torch.long)
+            labels = batch['labels'].to(device, dtype = torch.long)
+
+            #loss, tr_logits = model(input_ids=ids, attention_mask=mask, labels=labels)
+            output = model(input_ids=ids, attention_mask=mask, labels=labels)
+            tr_loss += output[0]
+
+            nb_tr_steps += 1
+            nb_tr_examples += labels.size(0)
+            
+            # compute training accuracy
+            flattened_targets = labels.view(-1) # shape (batch_size * seq_len,)
+            active_logits = output[1].view(-1, model.num_labels) # shape (batch_size * seq_len, num_labels)
+            flattened_predictions = torch.argmax(active_logits, axis=1) # shape (batch_size * seq_len,)
+            
+            # only compute accuracy at active labels
+            active_accuracy = labels.view(-1) != -100 # shape (batch_size, seq_len)
+            #active_labels = torch.where(active_accuracy, labels.view(-1), torch.tensor(-100).type_as(labels))
+            
+            labels = torch.masked_select(flattened_targets, active_accuracy)
+            predictions = torch.masked_select(flattened_predictions, active_accuracy)
+            
+            tr_labels.extend(labels)
+            tr_preds.extend(predictions)
+
+            tmp_tr_accuracy = accuracy_score(labels.cpu().numpy(), predictions.cpu().numpy())
+            tr_accuracy += tmp_tr_accuracy
         
-        # backward pass
-        optimizer.zero_grad()
-        output['loss'].backward()
-        optimizer.step()
+            # gradient clipping
+            torch.nn.utils.clip_grad_norm_(
+                parameters=model.parameters(), max_norm=max_grad_norm
+            )
+            
+            # backward pass
+            optimizer.zero_grad()
+            output['loss'].backward()
+            optimizer.step()        
+        else:
+            ids = batch['input_ids'].to(device, dtype = torch.long)
+            mask = batch['attention_mask'].to(device, dtype = torch.long)
+            labels = batch['labels'].to(device, dtype = torch.long)
+
+            #loss, tr_logits = model(input_ids=ids, attention_mask=mask, labels=labels)
+            output = model(input_ids=ids, attention_mask=mask, labels=labels)
+            logits = output['logits']
+
+            #calculate loss
+            active_labels = labels[labels != -100] 
+            active_logits = logits[labels != -100]
+            
+            logits_maxval, logits_pred = torch.max( mysoftmax(active_logits), dim = 1)
+            prediction_values = torch.cat((prediction_values, logits_maxval.detach().cpu() ))
+            continue
+
+            is_incorrect = logits_pred != active_labels
+            is_correct = logits_pred == active_labels
+            
+            is_sleep = logits_maxval > sleep_threshold
+            is_confused = logits_maxval < confused_threshold
+
+            loss = loss_function(active_logits, active_labels)
+            
+            accelerated_loss =  (loss * is_correct * is_sleep * correct_sleep_gamma) + \
+                                (loss * is_correct * is_confused * correct_confused_gamma) + \
+                                (loss * is_incorrect * is_sleep * incorrect_sleep_gamma) + \
+                                (loss * is_incorrect * is_confused * incorrect_confused_gamma)
+
+            accelerated_loss = torch.sum(accelerated_loss)
+            # backward pass
+            optimizer.zero_grad()
+            accelerated_loss.backward()
+            optimizer.step()  
+
+    
+    print('MEAN:', torch.mean(prediction_values).item(), 'STD:', torch.std(prediction_values).item())
 
     epoch_loss = tr_loss / nb_tr_steps
     tr_accuracy = tr_accuracy / nb_tr_steps
@@ -94,9 +152,9 @@ def testing(model, testing_loader, labels_to_ids, device):
             nb_eval_steps += 1
             nb_eval_examples += labels.size(0)
         
-            if idx % 100==0:
-                loss_step = eval_loss/nb_eval_steps
-                print(f"Validation loss per 100 evaluation steps: {loss_step}")
+            #if idx % 100==0:
+            #    loss_step = eval_loss/nb_eval_steps
+            #    print(f"Validation loss per 100 evaluation steps: {loss_step}")
               
             # compute evaluation accuracy
             flattened_targets = labels.view(-1) # shape (batch_size * seq_len,)
@@ -142,9 +200,9 @@ def read_tb_gum():
 
     return train_tb, dev_tb, test_tb, train_gum, dev_gum, test_gum, train_labels, dev_labels, test_labels
 
-def main(n_epochs, model_name, train_dataset_location, model_save_flag, model_save_location, model_load_flag, model_load_location, in_train_logfile):
+def main(n_epochs, model_name, dataset_name, model_save_flag, model_save_location, model_load_flag, model_load_location, in_train_logfile):
     #Initialization training parameters
-    max_len = 256
+    max_len = 128
     train_batch_size = 32
     dev_batch_size = 32
     test_batch_size = 32
@@ -153,14 +211,10 @@ def main(n_epochs, model_name, train_dataset_location, model_save_flag, model_sa
 
     #Reading datasets and initializing data loaders
     train_tb, dev_tb, test_tb, train_gum, dev_gum, test_gum, train_labels, dev_labels, test_labels = read_tb_gum()
-    if train_dataset_location == 'GUM':
-        train_data = train_gum
+    if dataset_name == 'GUM':
+        input_data = (train_gum, dev_gum, test_gum, train_labels, dev_labels, test_labels)
     else:
-        train_data = load_data(train_dataset_location)
-        
-
-    input_data_gum = (train_data, dev_gum, test_gum, train_labels, dev_labels, test_labels)
-    input_data_tb = (train_tb, dev_tb, test_tb, train_labels, dev_labels, test_labels)
+        input_data = (train_tb, dev_tb, test_tb, train_labels, dev_labels, test_labels)
 
     #Define tokenizer, model and optimizer
     device = 'cuda' if cuda.is_available() else 'cpu' #save the processing time
@@ -173,31 +227,30 @@ def main(n_epochs, model_name, train_dataset_location, model_save_flag, model_sa
     optimizer = torch.optim.Adam(params=model.parameters(), lr=learning_rate)
     model.to(device)
 
-    #Get dataloaders
-    train_loader, dev_loader, test_loader = initialize_data(tokenizer, initialization_input, input_data_gum)
-    train_loader_tb, dev_loader_tb, test_loader_tb = initialize_data(tokenizer, initialization_input, input_data_tb)
+    train_loader, dev_loader, test_loader = initialize_data(tokenizer, initialization_input, input_data)
 
     best_dev_acc = 0
     best_test_acc = 0
     best_epoch = -1
     best_tb_acc = 0
     best_tb_epoch = -1
+    divide_ratio = 0.5
     for epoch in range(n_epochs):
+        #Get dataloaders at each epoch so that it can be split again
         start = time.time()
         print(f"Training epoch: {epoch + 1}")
 
-        #train model
-        model = train(epoch, train_loader, model, optimizer, device)
-        
+        #train standard
+        model = train(epoch, train_loader, model, optimizer, device, divide_ratio)
+
         #testing and logging
-        labels_dev, predictions_dev, dev_accuracy = testing(model, dev_loader, dev_labels, device)
-        print('DEV ACC:', dev_accuracy)
+        #labels_dev, predictions_dev, dev_accuracy = testing(model, dev_loader, dev_labels, device)
+        #print('DEV ACC:', dev_accuracy)
         
         labels_test, predictions_test, test_accuracy = testing(model, test_loader, test_labels, device)
         print('TEST ACC:', test_accuracy)
-        
-        labels_test_tb, predictions_test_tb, test_accuracy_tb = testing(model, test_loader_tb, test_labels, device)
-        print('TB TEST ACC:', test_accuracy_tb)
+        print()
+        continue
 
         #saving model
         if dev_accuracy > best_dev_acc:
@@ -242,53 +295,47 @@ def main(n_epochs, model_name, train_dataset_location, model_save_flag, model_sa
 
 
 if __name__ == '__main__':
-    n_epochs = 15
-    n_iterations = 5
+    n_epochs = 30
+    n_iterations = 1
 
-    models = ['bert-base-uncased', 'roberta-base', 'xlm-roberta-base']
-    train_dataset_directory = '../Datasets/POSTagging/GUM_augemented/'
-    training_datasets = ['GUM']#only have strings in here. Also, remove .pkl
-
+    models = ['bert-base-uncased']
+    training_datasets = ['tb']
 
     for model_name in models:
-        for dataset in training_datasets:
-            if dataset == 'GUM':
-                train_dataset_location = dataset
-            else:
-                train_dataset_location = train_dataset_directory  + dataset + '.pkl'
+        for dataset_name in training_datasets:
 
             #model saving parameters
             model_save_flag = True
             model_load_flag = False
-            model_save_location = '../../saved_models/' + model_name + '_' + dataset
+            model_save_location = '../../saved_models/' + model_name + '_' + dataset_name
             model_load_location = None
     
             #logfile
-            in_train_logfile = 'logs/training_logs/intrain_' + model_name + '_' + dataset + '.txt'
-            result_logfile = 'logs/training_logs/results_' + model_name + '_' + dataset + '.txt'
+            in_train_logfile = 'logs/training_logs/intrain_' + model_name + '_' + dataset_name + '.txt'
+            result_logfile = 'logs/training_logs/results_' + model_name + '_' + dataset_name + '.txt'
 
             #initialize logfiles
             f = open(in_train_logfile, 'w')
             f.write('='*50 + '\n')
-            f.write('MODEL NAME : ' + model_name + ' | ' + 'DATASET : ' + dataset + '\n')
+            f.write('MODEL NAME : ' + model_name + ' | ' + 'DATASET : ' + dataset_name + '\n')
             f.write('='*50 + '\n')
             f.close()
 
             g = open(result_logfile, 'w')
             g.write('='*50 + '\n')
-            g.write('MODEL NAME : ' + model_name + ' | ' + 'DATASET : ' + dataset + '\n')
+            g.write('MODEL NAME : ' + model_name + ' | ' + 'DATASET : ' + dataset_name + '\n')
             g.write('='*50 + '\n')
             g.close()
 
             all_dev_acc, all_test_acc, all_test_tb_acc, all_best_epoch, all_best_tb_epoch = [], [], [], [], []
             for i in range(n_iterations):
-                print(model_name, dataset, 'ITERATION:', i )
+                print(model_name, dataset_name, 'ITERATION:', i )
 
                 f = open(in_train_logfile, 'a')
                 f.write('ITERAION : ' + str(i) + '\n\n')
                 f.close()
 
-                best_dev_acc, best_test_acc, best_tb_acc, best_epoch, best_tb_epoch = main(n_epochs, model_name, train_dataset_location, model_save_flag, model_save_location, model_load_flag, model_load_location, in_train_logfile)
+                best_dev_acc, best_test_acc, best_tb_acc, best_epoch, best_tb_epoch = main(n_epochs, model_name, dataset_name, model_save_flag, model_save_location, model_load_flag, model_load_location, in_train_logfile)
                 all_dev_acc.append(best_dev_acc)
                 all_test_acc.append(best_test_acc)
                 all_test_tb_acc.append(best_tb_acc)

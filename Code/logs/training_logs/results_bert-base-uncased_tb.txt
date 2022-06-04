@@ -1,0 +1,18 @@
+==================================================
+MODEL NAME : bert-base-uncased | DATASET : tb
+==================================================
+ITERAION : 0
+BEST DEV ACC : 0
+BEST TEST ACC : 0
+BEST EPOCH : -1
+BEST TEST TB ACC : 0
+BEST TB EPOCH : -1
+------------------------------
+
+FINAL RESULTS : 
+MEAN DEV ACC : 0.0|STD DEV ACC : 0.0
+MEAN TEST ACC : 0.0|STD TEST ACC : 0.0
+MEAN BEST EPOCH : -1.0
+MEAN TES TB ACC : 0.0|STD TEST ACC TB : 0.0
+MEAN BEST TBEPOCH : -1.0
+------------------------------
